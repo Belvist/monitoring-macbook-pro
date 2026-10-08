@@ -1,0 +1,20 @@
+#!/bin/bash
+# Native application launcher. On the first run, builds the SwiftUI executable.
+set -uo pipefail
+APP="$(cd "$(dirname "$0")/../.." && pwd)"
+RES="$APP/Contents/Resources"
+BIN="$APP/Contents/MacOS/.MacScopeNative"
+LOG="$HOME/Library/Logs/MacScope-build.log"
+
+show_error() {
+    /usr/bin/osascript -e 'display dialog "Не удалось собрать MacScope. Открой файл ~/Library/Logs/MacScope-build.log или запусти Собрать_на_Mac.command, чтобы увидеть ошибку." buttons {"OK"} default button "OK" with icon caution' >/dev/null 2>&1 || true
+}
+
+if [ ! -x "$BIN" ] || [ "$RES/CoreLogic.swift" -nt "$BIN" ] || [ "$RES/MacCollector.swift" -nt "$BIN" ] || [ "$RES/MacScopeApp.swift" -nt "$BIN" ]; then
+    /usr/bin/osascript -e 'display notification "Подготавливаю нативное приложение для запуска." with title "MacScope"' >/dev/null 2>&1 || true
+    if ! "$RES/build-native.sh"; then
+        show_error
+        exit 1
+    fi
+fi
+exec "$BIN" "$@"
