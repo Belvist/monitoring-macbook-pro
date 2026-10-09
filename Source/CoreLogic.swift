@@ -4,8 +4,8 @@ struct ProcessInfoRow: Identifiable, Hashable {
     let pid: Int32
     let uid: UInt32
     let parentPID: Int32
-    let cpu: Double
-    let memoryBytes: Int64
+    var cpu: Double
+    var memoryBytes: Int64
     let command: String
     var id: Int32 { pid }
     var name: String {
@@ -73,6 +73,10 @@ struct ResourceSnapshot {
     var error: String? = nil
 }
 
+enum ProcessSort {
+    case name, pid, cpu, ram
+}
+
 enum CoreLogic {
     static func parsePS(_ raw: String) -> [ProcessInfoRow] {
         raw.split(separator: "\n").compactMap { line in
@@ -87,6 +91,106 @@ enum CoreLogic {
                                   cpu: max(0, cpu), memoryBytes: max(0, rssKB) * 1024,
                                   command: String(parts[5]))
         }
+    }
+
+    static func parsePSTime(_ raw: String) -> [Int32: Double] {
+        var out: [Int32: Double] = [:]
+        for line in raw.split(separator: "\n") {
+            let parts = line.split(omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+            guard parts.count == 2, let pid = Int32(parts[0]),
+                  let seconds = cpuTimeSeconds(String(parts[1])) else { continue }
+            out[pid] = seconds
+        }
+        return out
+    }
+
+    static func cpuTimeSeconds(_ value: String) -> Double? {
+        // ps TIME: [[D-]H:]M:SS[.cc], e.g. "3:08.80", "266:46.30", "1:02:03".
+        var rest = value.trimmingCharacters(in: .whitespaces)
+        var days = 0.0
+        if let dash = rest.firstIndex(of: "-") {
+            guard let d = Double(rest[..<dash]) else { return nil }
+            days = d
+            rest = String(rest[rest.index(after: dash)...])
+        }
+        let fields = rest.split(separator: ":").map { Double($0) ?? -1 }
+        guard !fields.isEmpty, !fields.contains(where: { $0 < 0 }) else { return nil }
+        let seconds: Double
+        if fields.count == 2 { seconds = fields[0] * 60 + fields[1] }
+        else if fields.count == 3 { seconds = fields[0] * 3600 + fields[1] * 60 + fields[2] }
+        else { return nil }
+        return days * 86400 + seconds
+    }
+
+    static func deltaCPU(current: [Int32: (time: Double, command: String)],
+                         previous: [Int32: (time: Double, command: String)],
+                         wall: Double, cores: Int) -> [Int32: Double] {
+        // Та же методология, что у Activity Monitor: доля cputime за интервал.
+        // Шкала на процесс — проценты одного ядра (может быть >100).
+        guard wall > 0.2, cores > 0 else { return [:] }
+        let cap = Double(cores) * 100
+        var out: [Int32: Double] = [:]
+        for (pid, sample) in current {
+            // Команда сверяется, чтобы reused PID не давал мусорную дельту.
+            guard let old = previous[pid], old.command == sample.command else { continue }
+            let value = (sample.time - old.time) / wall * 100
+            guard value.isFinite else { continue }
+            out[pid] = min(cap, max(0, value))
+        }
+        return out
+    }
+
+    static func sortProcesses(_ rows: [ProcessInfoRow], by key: ProcessSort, ascending: Bool) -> [ProcessInfoRow] {
+        rows.sorted { a, b in
+            switch key {
+            case .cpu: return ascending ? a.cpu < b.cpu : a.cpu > b.cpu
+            case .ram: return ascending ? a.memoryBytes < b.memoryBytes : a.memoryBytes > b.memoryBytes
+            case .pid: return ascending ? a.pid < b.pid : a.pid > b.pid
+            case .name:
+                let r = a.name.localizedCaseInsensitiveCompare(b.name)
+                if r == .orderedSame { return ascending ? a.pid < b.pid : a.pid > b.pid }
+                return ascending ? r == .orderedAscending : r == .orderedDescending
+            }
+        }
+    }
+
+    static func parseTopMem(_ raw: String) -> [Int32: Int64] {
+        // top -l 1 -stats pid,mem: строки вида "59115  7063M". MEM у top — footprint
+        // (резидентная + сжатая + swap + GPU-память), как колонка памяти в Activity Monitor.
+        var out: [Int32: Int64] = [:]
+        for line in raw.split(separator: "\n") {
+            let parts = line.split(omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+            guard parts.count >= 2, let pid = Int32(parts[0]) else { continue }
+            var num = String(parts[1]).uppercased()
+            var mult = 1.0
+            if let last = num.last, "KMGT".contains(last) {
+                num = String(num.dropLast())
+                mult = ["K": 1024, "M": 1048576, "G": 1073741824, "T": 1099511627776][String(last)] ?? 1
+            }
+            guard let value = Double(num.replacingOccurrences(of: ",", with: ".")) else { continue }
+            out[pid] = Int64(value * mult)
+        }
+        return out
+    }
+
+    static func processTree(rootPID: Int32, rows: [ProcessInfoRow]) -> [ProcessInfoRow] {
+        // Всё дерево: корень + потомки любого уровня вложенности.
+        var byPID: [Int32: ProcessInfoRow] = [:]
+        var children: [Int32: [ProcessInfoRow]] = [:]
+        for r in rows { byPID[r.pid] = r; children[r.parentPID, default: []].append(r) }
+        guard let root = byPID[rootPID] else { return [] }
+        var out = [root]
+        var queue = [root]
+        var seen: Set<Int32> = [rootPID]
+        while !queue.isEmpty {
+            let cur = queue.removeFirst()
+            for child in children[cur.pid] ?? [] where !seen.contains(child.pid) {
+                seen.insert(child.pid)
+                out.append(child)
+                queue.append(child)
+            }
+        }
+        return out
     }
 
     static func parseLsof(_ raw: String) -> [PortListener] {

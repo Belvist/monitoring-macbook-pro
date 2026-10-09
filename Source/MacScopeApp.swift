@@ -109,6 +109,16 @@ private final class MonitorStore: ObservableObject {
             }
         }
     }
+
+    func killTree(pid: Int32, command: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = MacCollector.killTree(pid: pid, command: command)
+            DispatchQueue.main.async { [weak self] in
+                self?.errorMessage = result
+                self?.refresh()
+            }
+        }
+    }
 }
 
 @main
@@ -133,9 +143,15 @@ private struct MacScopeWindow: View {
     @State private var selectedService: String? = nil
     @State private var pendingStop: LocalService? = nil
     @State private var showStopAlert = false
+    @State private var pendingKill: ProcessInfoRow? = nil
+    @State private var showKillAlert = false
+    @State private var showKillConfirm = false
+    @State private var showServiceKillConfirm = false
     @State private var renameService: LocalService? = nil
     @State private var renameDraft = ""
     @State private var showErrorAlert = false
+    @State private var processSort: ProcessSort = .cpu
+    @State private var processAscending = false
     @State private var diskTargets: [DiskTarget] = []
     private let timer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
@@ -147,9 +163,10 @@ private struct MacScopeWindow: View {
     }
     private var processes: [ProcessInfoRow] {
         let all = store.snapshot.processes
-        return (search.isEmpty || tab != .processes ? all : all.filter {
+        let filtered = search.isEmpty || tab != .processes ? all : all.filter {
             "\($0.name) \($0.command) \($0.pid)".localizedCaseInsensitiveContains(search)
-        }).prefix(150).map { $0 }
+        }
+        return Array(CoreLogic.sortProcesses(filtered, by: processSort, ascending: processAscending).prefix(150))
     }
 
     var body: some View {
@@ -178,12 +195,24 @@ private struct MacScopeWindow: View {
         .onReceive(timer) { _ in store.refresh() }
         .alert("Остановить процесс?", isPresented: $showStopAlert) {
             Button("Отмена", role: .cancel) { pendingStop = nil }
-            Button("Остановить", role: .destructive) {
+            Button("Остановить") {
                 if let service = pendingStop { store.stop(service) }
                 pendingStop = nil
             }
+            Button("Убить полностью", role: .destructive) {
+                if pendingStop != nil { showServiceKillConfirm = true }
+            }
         } message: {
-            Text("Процесс \(pendingStop?.processName ?? "") (PID \(pendingStop?.pid ?? 0)) будет завершён через SIGTERM. Все его сервисы перестанут работать. Несохранённые данные могут быть потеряны.")
+            Text("Процесс \(pendingStop?.processName ?? "") (PID \(pendingStop?.pid ?? 0)) будет завершён. «Остановить» — мягко через SIGTERM. «Убить полностью» — всё дерево с дочерними процессами: сначала SIGTERM, несдавшихся добьёт SIGKILL. Несохранённые данные могут быть потеряны.")
+        }
+        .alert("Точно убить всё дерево?", isPresented: $showServiceKillConfirm) {
+            Button("Отмена", role: .cancel) { pendingStop = nil }
+            Button("Убить полностью", role: .destructive) {
+                if let service = pendingStop { store.killTree(pid: service.pid, command: service.command) }
+                pendingStop = nil
+            }
+        } message: {
+            Text("«\(pendingStop?.processName ?? "")» (PID \(pendingStop?.pid ?? 0), порт \(pendingStop?.port ?? 0)) и все дочерние процессы будут завершены. Это последнее подтверждение, назад дороги не будет.")
         }
         .sheet(item: $renameService) { service in
             VStack(alignment: .leading, spacing: 16) {
@@ -204,6 +233,22 @@ private struct MacScopeWindow: View {
         .alert("Не удалось выполнить действие", isPresented: $showErrorAlert) {
             Button("Понятно") { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
+        .alert("Убить процесс полностью?", isPresented: $showKillAlert) {
+            Button("Отмена", role: .cancel) { pendingKill = nil }
+            Button("Выбрать") { showKillConfirm = true }
+        } message: {
+            Text("Выбран «\(pendingKill?.name ?? "")» (PID \(pendingKill?.pid ?? 0)). Нажми «Выбрать» — затем придётся подтвердить убийство ещё раз.")
+        }
+        .alert("Точно убить?", isPresented: $showKillConfirm) {
+            Button("Отмена", role: .cancel) { pendingKill = nil }
+            Button("Убить полностью", role: .destructive) {
+                if let target = pendingKill { store.killTree(pid: target.pid, command: target.command) }
+                pendingKill = nil
+            }
+        } message: {
+            let total = pendingKill.map { CoreLogic.processTree(rootPID: $0.pid, rows: store.snapshot.processes).count } ?? 0
+            Text("«\(pendingKill?.name ?? "")» (PID \(pendingKill?.pid ?? 0)) будет завершён вместе с дочерними — всего процессов: \(total). Сначала SIGTERM, несдавшихся добьёт SIGKILL. Это последнее подтверждение, назад дороги не будет.")
+        }
     }
 
     private var sidebar: some View {
@@ -478,10 +523,14 @@ private struct MacScopeWindow: View {
             }
             VStack(spacing: 0) {
                 HStack {
-                    Text("ПРОЦЕСС").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("PID").frame(width: 70, alignment: .trailing)
-                    Text("CPU").frame(width: 80, alignment: .trailing)
-                    Text("RAM").frame(width: 100, alignment: .trailing)
+                    sortHeader("ПРОЦЕСС", key: .name, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    sortHeader("PID", key: .pid, alignment: .trailing)
+                        .frame(width: 70, alignment: .trailing)
+                    sortHeader("CPU", key: .cpu, alignment: .trailing)
+                        .frame(width: 80, alignment: .trailing)
+                    sortHeader("RAM", key: .ram, alignment: .trailing)
+                        .frame(width: 100, alignment: .trailing)
                 }
                 .font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
                 .padding(15)
@@ -497,6 +546,14 @@ private struct MacScopeWindow: View {
                         Text(String(process.pid)).frame(width: 70, alignment: .trailing)
                         Text(String(format: "%.1f%%", process.cpu)).frame(width: 80, alignment: .trailing)
                         Text(CoreLogic.bytes(process.memoryBytes)).frame(width: 100, alignment: .trailing)
+                        if MacCollector.canKill(pid: process.pid, uid: process.uid) {
+                            Button { pendingKill = process; showKillAlert = true } label: {
+                                Image(systemName: "xmark.circle")
+                                    .font(.system(size: 13)).foregroundStyle(Theme.secondary)
+                            }.buttonStyle(.plain).help("Завершить процесс полностью")
+                        } else {
+                            Color.clear.frame(width: 13, height: 13)
+                        }
                     }
                     .font(.system(size: 11, design: .monospaced))
                     .padding(.horizontal, 15).padding(.vertical, 10)
@@ -563,6 +620,26 @@ private struct MacScopeWindow: View {
         .padding(.horizontal, 12).frame(width: 245, height: 34)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
+    }
+
+    private func sortHeader(_ title: String, key: ProcessSort, alignment: Alignment) -> some View {
+        Button {
+            if processSort == key { processAscending.toggle() }
+            else { processSort = key; processAscending = (key == .name) }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                Image(systemName: processSort == key
+                      ? (processAscending ? "chevron.up" : "chevron.down")
+                      : "chevron.up.chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .opacity(processSort == key ? 1 : 0.35)
+            }
+            .frame(maxWidth: .infinity, alignment: alignment)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Сортировать по \(title.lowercased())")
     }
 
     private func serviceIcon(_ service: LocalService) -> some View {

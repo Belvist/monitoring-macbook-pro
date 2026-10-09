@@ -38,6 +38,29 @@ struct MacCollector {
         let psRaw = Shell.output("/bin/ps", ["-ww", "-axo", "pid=,uid=,ppid=,%cpu=,rss=,command="])
         s.processes = CoreLogic.parsePS(psRaw)
         if psRaw.isEmpty { s.error = "macOS не разрешила получить список процессов" }
+
+        // ps rss — только резидентная память: сжатая, swap и GPU-память (MPS/Metal) в неё
+        // не входят, поэтому процесс на 6 ГБ выглядит как 400 МБ. MEM у top — полный
+        // footprint как в Activity Monitor, берём его, rss остаётся запасным вариантом.
+        let topMem = CoreLogic.parseTopMem(Shell.output("/usr/bin/top",
+            ["-l", "1", "-n", String(s.processes.count + 64), "-o", "mem", "-stats", "pid,mem"]))
+        if !topMem.isEmpty {
+            for i in s.processes.indices {
+                if let m = topMem[s.processes[i].pid] { s.processes[i].memoryBytes = m }
+            }
+        }
+
+        // %cpu из ps — среднее за всё время жизни процесса, для текущей нагрузки врёт.
+        // Считаем по дельтам суммарного cputime между замерами, как Activity Monitor.
+        let count = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let times = CoreLogic.parsePSTime(Shell.output("/bin/ps", ["-axo", "pid=,time="]))
+        var deltaTotal: Double? = nil
+        if let deltas = sampledCPU(processes: s.processes, times: times, cores: count) {
+            for i in s.processes.indices {
+                if let v = deltas[s.processes[i].pid] { s.processes[i].cpu = v }
+            }
+            deltaTotal = deltas.values.reduce(0, +)
+        }
         s.processes.sort { $0.cpu > $1.cpu }
 
         let rawLsof = Shell.output("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcfn"])
@@ -72,8 +95,8 @@ struct MacCollector {
         }
         s.services = dedup.values.sorted { $0.port < $1.port }
 
-        let count = max(1, ProcessInfo.processInfo.activeProcessorCount)
-        s.cpuPercent = min(100, s.processes.reduce(0) { $0 + $1.cpu } / Double(count))
+        if let deltaTotal { s.cpuPercent = min(100, deltaTotal / Double(count)) }
+        else { s.cpuPercent = min(100, s.processes.reduce(0) { $0 + $1.cpu } / Double(count)) }
         s.totalRAM = Int64(ProcessInfo.processInfo.physicalMemory)
         let vm = Shell.output("/usr/bin/vm_stat", [])
         let memory = parseVM(vm, physical: s.totalRAM)
@@ -90,6 +113,26 @@ struct MacCollector {
         return s
     }
 
+    private static let cpuLock = NSLock()
+    private static var cpuPrevious: (at: Date, times: [Int32: (time: Double, command: String)])? = nil
+
+    /// Возвращает per-core % по дельтам cputime или nil на первом замере (тогда caller берёт ps %cpu).
+    static func sampledCPU(processes: [ProcessInfoRow], times: [Int32: Double], cores: Int) -> [Int32: Double]? {
+        let now = Date()
+        var current: [Int32: (time: Double, command: String)] = [:]
+        current.reserveCapacity(processes.count)
+        for row in processes {
+            guard let t = times[row.pid] else { continue }
+            current[row.pid] = (t, row.command)
+        }
+        cpuLock.lock()
+        defer { cpuLock.unlock(); cpuPrevious = (now, current) }
+        guard let prev = cpuPrevious else { return nil }
+        let wall = now.timeIntervalSince(prev.at)
+        guard wall > 0.5 else { return nil }
+        return CoreLogic.deltaCPU(current: current, previous: prev.times, wall: wall, cores: cores)
+    }
+
     static func parseVM(_ raw: String, physical: Int64) -> (used: Int64, compressed: Int64) {
         let size: Int64
         if let re = try? NSRegularExpression(pattern: #"page size of\s+(\d+)\s+bytes"#),
@@ -104,10 +147,13 @@ struct MacCollector {
             let number = String(parts[1]).trimmingCharacters(in: CharacterSet(charactersIn: " .\t"))
             if let pages = Int64(number) { counters[key] = pages }
         }
-        let free = (counters["Pages free"] ?? 0) + (counters["Pages inactive"] ?? 0) + (counters["Pages speculative"] ?? 0)
+        // Как Activity Monitor: занято = active + wired + compressed.
+        // Inactive/speculative — это файловый кэш, он считается отдельно, а не занятой памятью.
+        let used = ((counters["Pages active"] ?? 0) + (counters["Pages wired down"] ?? 0)
+            + (counters["Pages occupied by compressor"] ?? 0)) * size
         let compressed = (counters["Pages occupied by compressor"] ?? 0) * size
         guard !raw.isEmpty, physical > 0 else { return (0, 0) }
-        return (max(0, min(physical, physical - free * size)), compressed)
+        return (max(0, min(physical, used)), compressed)
     }
 
     static func parseSwap(_ raw: String) -> Int64 {
@@ -130,8 +176,9 @@ struct MacCollector {
         var received: Int64 = 0
         var sent: Int64 = 0
         for cells in rows.dropFirst() {
+            // Один link-row на интерфейс; lo0 исключаем, остальное (en*, bridge, utun/VPN) считаем.
             guard cells.count > max(rx, tx), let device = cells.first,
-                  device.hasPrefix("en"), device.dropFirst(2).allSatisfy({ $0.isNumber }),
+                  device != "lo0",
                   cells.contains(where: { $0.hasPrefix("<Link#") }),
                   let rin = Int64(cells[rx]), let rout = Int64(cells[tx]) else { continue }
             received += max(0, rin)
@@ -200,6 +247,59 @@ struct MacCollector {
                         completionHandler: @escaping (URLRequest?) -> Void) {
             completionHandler(nil) // never follow a local server redirect to a remote domain
         }
+    }
+
+    static func canKill(pid: Int32, uid: UInt32) -> Bool {
+        pid > 1 && pid != getpid() && uid == getuid()
+    }
+
+    static func isAlive(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0
+    }
+
+    static func zombiePIDs(_ pids: [Int32]) -> Set<Int32> {
+        guard !pids.isEmpty else { return [] }
+        let wanted = Set(pids)
+        let raw = Shell.output("/bin/ps", ["-axo", "pid=,stat="])
+        var zombies: Set<Int32> = []
+        for line in raw.split(separator: "\n") {
+            let parts = line.split(omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+            guard parts.count == 2, let pid = Int32(parts[0]), wanted.contains(pid),
+                  parts[1].uppercased().contains("Z") else { continue }
+            zombies.insert(pid)
+        }
+        return zombies
+    }
+
+    /// Полное снятие задачи: SIGTERM всему дереву, несдавшимся — SIGKILL.
+    /// Возвращает nil при успехе (зомби считаются успехом: они уже мертвы), иначе текст ошибки.
+    static func killTree(pid: Int32, command: String) -> String? {
+        let selfPID = getpid()
+        guard pid > 1, pid != selfPID else { return "Этот процесс нельзя остановить из MacScope." }
+        let myUID = getuid()
+        // Дерево строим по свежему снимку, корень сверяем с командой — защита от reused PID.
+        let rows = CoreLogic.parsePS(Shell.output("/bin/ps", ["-ww", "-axo", "pid=,uid=,ppid=,%cpu=,rss=,command="]))
+        guard let root = rows.first(where: { $0.pid == pid }),
+              root.uid == myUID, root.command == command else {
+            return "Процесс уже завершился или изменился. Обнови список."
+        }
+        let tree = CoreLogic.processTree(rootPID: pid, rows: rows)
+            .filter { $0.uid == myUID && $0.pid != selfPID }
+        guard !tree.isEmpty else { return "Процесс уже завершился." }
+        for p in tree { kill(p.pid, SIGTERM) }
+        Thread.sleep(forTimeInterval: 1.2)
+        var alive = Set(tree.map(\.pid).filter { isAlive($0) })
+        if !alive.isEmpty {
+            // Детей добиваем первыми, корень последним.
+            for p in tree.reversed() where alive.contains(p.pid) { kill(p.pid, SIGKILL) }
+            Thread.sleep(forTimeInterval: 0.5)
+            alive = Set(tree.map(\.pid).filter { isAlive($0) })
+        }
+        let still = alive.subtracting(zombiePIDs(Array(alive)))
+        guard !still.isEmpty else { return nil }
+        let names = tree.filter { still.contains($0.pid) }.prefix(4)
+            .map { "\($0.name) (\($0.pid))" }.joined(separator: ", ")
+        return "Не удалось завершить: \(names). Возможно, висит в дисковом ожидании — уйдёт сам или после перезагрузки."
     }
 
     static func terminate(_ service: LocalService) -> String? {
