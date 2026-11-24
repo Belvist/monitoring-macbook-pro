@@ -44,10 +44,13 @@ private final class MonitorStore: ObservableObject {
     @Published var networkUp: Int64 = 0
     @Published var names: [String: String] = UserDefaults.standard.dictionary(forKey: "portNames") as? [String: String] ?? [:]
     @Published var errorMessage: String? = nil
+    @Published var scanning = false
     private var lastProbed = Date.distantPast
-    private var scanning = false
 
     func refresh() {
+        // footprint считается дорого — обновляем его в фоне не чаще раза в 10 с,
+        // а обычный опрос метрик от этого не зависит.
+        DispatchQueue.global(qos: .utility).async { MacCollector.refreshFootprint() }
         guard !loading else { return }
         loading = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -72,18 +75,36 @@ private final class MonitorStore: ObservableObject {
     }
 
     private func startProbingIfNeeded() {
-        guard !scanning && Date().timeIntervalSince(lastProbed) > 25 else { return }
+        guard !scanning && Date().timeIntervalSince(lastProbed) > 20 else { return }
+        let all = snapshot.services
+        // Системные службы — не сайты, их не опрашиваем. Свои — все, без обрезания до 20.
+        let targets = all.filter { $0.userOwned && $0.kind != .infrastructure }
+        guard !targets.isEmpty else { return }
         scanning = true
         lastProbed = Date()
-        let services = Array(snapshot.services.prefix(20))
+        let validIDs = Set(all.map(\.id))
+        DispatchQueue.main.async { [weak self] in
+            self?.probes = self?.probes.filter { validIDs.contains($0.key) } ?? [:]
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            for item in services {
-                let probe = MacCollector.probeWebsite(service: item)
-                DispatchQueue.main.async { [weak self] in
-                    self?.probes[item.id] = probe
+            let queue = OperationQueue()
+            queue.maxConcurrentOperationCount = 6
+            queue.qualityOfService = .utility
+            for item in targets {
+                queue.addOperation {
+                    let probe = MacCollector.probeWebsite(service: item)
+                    DispatchQueue.main.async { [weak self] in self?.probes[item.id] = probe }
                 }
             }
+            queue.waitUntilAllOperationsAreFinished()
             DispatchQueue.main.async { [weak self] in self?.scanning = false }
+        }
+    }
+
+    func probeNow(_ service: LocalService) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let probe = MacCollector.probeWebsite(service: service)
+            DispatchQueue.main.async { [weak self] in self?.probes[service.id] = probe }
         }
     }
 
@@ -152,14 +173,43 @@ private struct MacScopeWindow: View {
     @State private var showErrorAlert = false
     @State private var processSort: ProcessSort = .cpu
     @State private var processAscending = false
+    @State private var serviceFilter: ServiceFilter = .all
+    @State private var serviceSort: ServiceSort = .port
+    @State private var serviceAscending = true
     @State private var diskTargets: [DiskTarget] = []
     private let timer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
-    private var services: [LocalService] {
-        guard !search.isEmpty && tab == .services else { return store.snapshot.services }
-        return store.snapshot.services.filter { service in
-            "\(store.displayName(service)) \(service.processName) \(service.port) \(service.workingDirectory)".localizedCaseInsensitiveContains(search)
+    private enum ServiceFilter: CaseIterable {
+        case all, mine, system
+        var label: String {
+            switch self { case .all: return "Все"; case .mine: return "Мои"; case .system: return "Система" }
         }
+    }
+
+    private var allServices: [LocalService] { store.snapshot.services }
+
+    private var visibleServices: [LocalService] {
+        let base = allServices.filter { service in
+            switch serviceFilter {
+            case .all: break
+            case .mine: if !CoreLogic.isUserService(service) { return false }
+            case .system: if CoreLogic.isUserService(service) { return false }
+            }
+            guard !search.isEmpty, tab == .services else { return true }
+            let probe = store.probes[service.id]
+            return "\(store.displayName(service)) \(service.processName) \(service.port) \(service.command) \(service.workingDirectory) \(probe?.detail ?? "")".localizedCaseInsensitiveContains(search)
+        }
+        return CoreLogic.sortServices(base, by: serviceSort, ascending: serviceAscending) {
+            store.displayName($0)
+        }
+    }
+
+    private var myServices: [LocalService] { visibleServices.filter { CoreLogic.isUserService($0) } }
+    private var systemServices: [LocalService] { visibleServices.filter { !CoreLogic.isUserService($0) } }
+
+    private var selectedServiceItem: LocalService? {
+        if let id = selectedService, let item = visibleServices.first(where: { $0.id == id }) { return item }
+        return visibleServices.first(where: { CoreLogic.isUserService($0) }) ?? visibleServices.first
     }
     private var processes: [ProcessInfoRow] {
         let all = store.snapshot.processes
@@ -191,7 +241,11 @@ private struct MacScopeWindow: View {
             }
         }
         .background(Theme.background)
-        .onAppear { store.refresh(); diskTargets = MacCollector.interestingFiles() }
+        .onAppear {
+            DispatchQueue.global(qos: .utility).async { MacCollector.refreshFootprint(force: true) }
+            store.refresh()
+            diskTargets = MacCollector.interestingFiles()
+        }
         .onReceive(timer) { _ in store.refresh() }
         .alert("Остановить процесс?", isPresented: $showStopAlert) {
             Button("Отмена", role: .cancel) { pendingStop = nil }
@@ -348,7 +402,7 @@ private struct MacScopeWindow: View {
                     }
                     Sparkline(values: store.ramHistory, color: Theme.muted).frame(height: 65)
                 }
-                panel(title: "Сеть", subtitle: "Трафик сетевых интерфейсов en*") {
+                panel(title: "Сеть", subtitle: "Все интерфейсы кроме loopback") {
                     HStack {
                         Image(systemName: "arrow.down").foregroundStyle(Theme.muted)
                         Text(CoreLogic.bytes(store.networkDown) + "/с")
@@ -403,102 +457,241 @@ private struct MacScopeWindow: View {
     }
 
     private var servicesPage: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
+        let mine = allServices.filter { CoreLogic.isUserService($0) }
+        let system = allServices.filter { !CoreLogic.isUserService($0) }
+        return VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Локальные сайты и сервисы").font(.system(size: 27, weight: .bold, design: .rounded))
-                    Text("Порт, сайт, имя проекта, команда запуска и сколько ресурсов расходует сервер.")
+                    Text("Все TCP-слушатели macOS. Нагрузка — по процессу, который держит порт; 100% CPU = одно ядро.")
                         .font(.system(size: 12)).foregroundStyle(Theme.secondary)
                 }
                 Spacer()
                 searchField
             }
-            HStack(alignment: .top, spacing: 14) {
-                VStack(spacing: 0) {
-                    HStack {
-                        Text("НАЙДЕНО \(services.count)").font(.system(size: 10, weight: .bold)).tracking(1.1).foregroundStyle(Theme.secondary)
-                        Spacer()
-                        Text("ПОРТ").font(.system(size: 10, weight: .bold)).tracking(1.1).foregroundStyle(Theme.secondary)
-                    }.padding(15)
-                    Divider()
-                    if services.isEmpty { blank("Ничего не найдено") }
-                    ForEach(services) { service in
-                        Button { selectedService = service.id } label: {
-                            HStack(spacing: 11) {
-                                serviceIcon(service)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(store.displayName(service)).font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                                    HStack(spacing: 5) {
-                                        Text(service.processName)
-                                        if let probe = store.probes[service.id], probe.isHTTP {
-                                            Text("· \(probe.detail)").foregroundStyle(Theme.muted)
-                                        }
-                                    }.font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(1)
-                                }
-                                Spacer(minLength: 4)
-                                Text(":\(service.port)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.secondary)
-                                Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(Theme.secondary)
-                            }
-                            .padding(13)
-                            .background((selectedService ?? services.first?.id) == service.id ? Theme.accent.opacity(0.075) : Color.clear)
-                            .contentShape(Rectangle())
-                        }.buttonStyle(.plain)
-                        Divider()
+
+            HStack(spacing: 9) {
+                summaryChip("Всего", "\(allServices.count)", "number")
+                summaryChip("Моих", "\(mine.count)", "person")
+                summaryChip("Системных", "\(system.count)", "gearshape")
+                summaryChip("CPU моих", String(format: "%.1f%%", mine.reduce(0) { $0 + $1.cpu }), "cpu")
+                summaryChip("RAM моих", CoreLogic.bytes(mine.reduce(Int64(0)) { $0 + $1.memoryBytes }, digits: 0), "memorychip")
+                Spacer()
+                if store.scanning {
+                    ProgressView().controlSize(.small)
+                    Text("Проверка HTTP").font(.system(size: 10)).foregroundStyle(Theme.secondary)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Picker("", selection: $serviceFilter) {
+                    ForEach(ServiceFilter.allCases, id: \.self) { f in
+                        let n = f == .all ? allServices.count : (f == .mine ? mine.count : system.count)
+                        Text("\(f.label) \(n)").tag(f)
                     }
                 }
+                .pickerStyle(.segmented).frame(width: 350)
+                Spacer()
+                Menu {
+                    ForEach(ServiceSort.allCases, id: \.self) { key in
+                        Button {
+                            if serviceSort == key { serviceAscending.toggle() }
+                            else { serviceSort = key; serviceAscending = key.ascendingByDefault }
+                        } label: {
+                            HStack {
+                                Text("По \(key.label)")
+                                if serviceSort == key {
+                                    Image(systemName: serviceAscending ? "chevron.up" : "chevron.down")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Сортировка: \(serviceSort.label) \(serviceAscending ? "↑" : "↓")", systemImage: "arrow.up.arrow.down")
+                        .font(.system(size: 11))
+                }
+                .menuStyle(.borderlessButton).fixedSize()
+            }
+
+            HStack(alignment: .top, spacing: 14) {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        if visibleServices.isEmpty {
+                            blank(allServices.isEmpty ? "TCP-слушателей не найдено" : "Ничего не найдено — измени фильтр или поиск")
+                        }
+                        if !myServices.isEmpty {
+                            serviceSectionHeader("МОИ СЕРВИСЫ", myServices.count)
+                            ForEach(myServices) { service in serviceRow(service) }
+                        }
+                        if !systemServices.isEmpty {
+                            serviceSectionHeader("СИСТЕМНЫЕ СЛУЖБЫ", systemServices.count)
+                            ForEach(systemServices) { service in serviceRow(service) }
+                        }
+                    }
+                }
+                .frame(height: 490)
                 .background(Theme.card, in: RoundedRectangle(cornerRadius: 15))
                 .overlay(RoundedRectangle(cornerRadius: 15).stroke(Theme.border, lineWidth: 0.7))
-                .frame(minWidth: 330, maxWidth: .infinity)
+                .frame(minWidth: 370, maxWidth: .infinity)
 
-                if let item = services.first(where: { $0.id == (selectedService ?? services.first?.id) }) {
-                    serviceDetails(item).frame(minWidth: 310, maxWidth: .infinity)
-                } else { blank("Выбери сервис").frame(maxWidth: .infinity) }
+                if let item = selectedServiceItem {
+                    ScrollView { serviceDetails(item) }
+                        .frame(height: 490)
+                        .frame(minWidth: 330, maxWidth: .infinity)
+                } else {
+                    blank("Выбери сервис").frame(height: 490).frame(maxWidth: .infinity)
+                }
             }
-            Text("Названия веб-страниц определяются через HTTP на 127.0.0.1. Не-HTTP сервисы остаются отдельными типами. Если несколько процессов используют один порт, отображается владелец LISTEN-сокета.")
+
+            Text("HTTP-проверка стучится на адрес сокета (для 0.0.0.0 — на 127.0.0.1) и не следует редиректам. Не-HTTP сервисы остаются отдельными типами. Если порт слушают несколько процессов, показан владелец сокета; система и сторонние процессы не опрашиваются.")
                 .font(.system(size: 11)).foregroundStyle(Theme.secondary)
         }
     }
 
+    private func summaryChip(_ label: String, _ value: String, _ symbol: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol).font(.system(size: 10)).foregroundStyle(Theme.secondary)
+            Text(label).font(.system(size: 10)).foregroundStyle(Theme.secondary)
+            Text(value).font(.system(size: 11, weight: .bold, design: .monospaced))
+        }
+        .padding(.horizontal, 10).frame(height: 28)
+        .background(Theme.card, in: Capsule())
+        .overlay(Capsule().stroke(Theme.border, lineWidth: 0.7))
+    }
+
+    private func serviceSectionHeader(_ title: String, _ count: Int) -> some View {
+        HStack {
+            Text("\(title) · \(count)").font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(Theme.bar)
+    }
+
+    private func serviceRow(_ service: LocalService) -> some View {
+        let probe = store.probes[service.id]
+        let selected = selectedServiceItem?.id == service.id
+        return Button { selectedService = service.id } label: {
+            HStack(spacing: 10) {
+                serviceIcon(service).frame(width: 34, height: 34)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Text(store.displayName(service)).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                        if !CoreLogic.isUserService(service) {
+                            Text("СЛУЖБА").font(.system(size: 8, weight: .bold))
+                                .padding(.horizontal, 4).padding(.vertical, 2)
+                                .background(Theme.tile, in: Capsule())
+                        }
+                    }
+                    HStack(spacing: 4) {
+                        Text(service.processName)
+                        Text("· PID \(service.pid)")
+                        if let probe { Text("· \(probe.detail)").foregroundStyle(probe.isHTTP ? Theme.ink : Theme.secondary) }
+                    }
+                    .font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(":\(service.port)").font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    HStack(spacing: 6) {
+                        Text(String(format: "%.1f%%", service.cpu))
+                        Text(CoreLogic.bytes(service.memoryBytes, digits: 0))
+                    }
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(Theme.secondary)
+                }
+                Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(Theme.secondary)
+            }
+            .padding(11)
+            .background(selected ? Color.white.opacity(0.09) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .bottom) { Theme.border.frame(height: 0.5) }
+    }
+
     private func serviceDetails(_ service: LocalService) -> some View {
-        VStack(alignment: .leading, spacing: 17) {
+        let probe = store.probes[service.id]
+        return VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
                 serviceIcon(service).frame(width: 39, height: 39)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(store.displayName(service)).font(.system(size: 18, weight: .bold)).lineLimit(2)
-                    Text(store.probes[service.id]?.isHTTP == true ? "Локальная веб-страница" : service.kind.rawValue)
+                    Text(probe?.isHTTP == true ? "Локальная веб-страница" : service.kind.rawValue)
                         .font(.system(size: 11)).foregroundStyle(Theme.secondary)
                 }
                 Spacer()
             }
+
+            VStack(alignment: .leading, spacing: 9) {
+                sectionLabel("НАГРУЗКА")
+                loadRow("CPU", String(format: "%.1f%% одного ядра", service.cpu), service.cpu / 100)
+                loadRow("RAM", CoreLogic.bytes(service.memoryBytes),
+                        store.snapshot.totalRAM > 0 ? ratio(service.memoryBytes, store.snapshot.totalRAM) : 0)
+                Text("Один порт = один процесс. У браузеров и сервисов с дочерними процессами нагрузка разделена между ними.")
+                    .font(.system(size: 10)).foregroundStyle(Theme.secondary)
+            }
+
             Divider()
-            detail("Адрес", "\(service.address):\(service.port)")
-            detail("Процесс", "\(service.processName) · PID \(service.pid)")
-            detail("Владелец", service.userOwned ? "Твой пользователь" : "Другой пользователь / система")
-            detail("CPU", String(format: "%.1f%% одного ядра", service.cpu))
-            detail("RAM", CoreLogic.bytes(service.memoryBytes))
-            detail("Проверка HTTP", store.probes[service.id]?.detail ?? "Проверяется…")
-            if !service.workingDirectory.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("ПАПКА ПРОЕКТА").font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
-                    Text(service.workingDirectory).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                        .lineLimit(3)
+
+            VStack(alignment: .leading, spacing: 9) {
+                sectionLabel("СОКЕТ")
+                detail("Адрес", "\(service.address):\(service.port)")
+                HStack(spacing: 6) {
+                    Image(systemName: service.scope.symbol).font(.system(size: 10))
+                    Text(service.scope.label).font(.system(size: 11))
+                }.foregroundStyle(Theme.secondary)
+                detail("Процесс", "\(service.processName) · PID \(service.pid)")
+                detail("Владелец", CoreLogic.isUserService(service)
+                      ? "Твой пользователь" : (service.userOwned ? "Служба macOS" : "Другой пользователь"))
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("HTTP-ПРОВЕРКА")
+                HStack {
+                    Text(probe?.detail ?? "Проверяется…").font(.system(size: 11))
+                    Spacer()
+                    Button { store.probeNow(service) } label: {
+                        Image(systemName: "arrow.clockwise").font(.system(size: 11))
+                    }.buttonStyle(.plain).help("Повторить проверку")
+                }
+                if let title = probe?.title, !title.isEmpty {
+                    Text("Заголовок: \(title)").font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(2)
                 }
             }
-            VStack(alignment: .leading, spacing: 5) {
-                Text("КОМАНДА ЗАПУСКА").font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
-                Text(CoreLogic.safeCommand(service.command)).font(.system(size: 10, design: .monospaced))
-                    .textSelection(.enabled).lineLimit(5)
+
+            if !service.workingDirectory.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    sectionLabel("ПАПКА ПРОЕКТА")
+                    Text(service.workingDirectory).font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled).lineLimit(3)
+                }
             }
+
+            VStack(alignment: .leading, spacing: 5) {
+                sectionLabel("КОМАНДА ЗАПУСКА")
+                Text(CoreLogic.safeCommand(service.command)).font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled).lineLimit(4)
+            }
+
             Divider()
+
             HStack(spacing: 8) {
                 Button {
                     if let url = service.pageURL { NSWorkspace.shared.open(url) }
                 } label: { Label("Открыть сайт", systemImage: "arrow.up.right.square") }
                 .buttonStyle(.borderedProminent).tint(.white)
-                .disabled(store.probes[service.id]?.isHTTP != true)
+                .disabled(probe?.isHTTP != true)
                 Button { renameDraft = store.names[String(service.port)] ?? service.defaultName; renameService = service } label: {
                     Image(systemName: "pencil")
                 }.buttonStyle(.bordered).help("Переименовать порт")
+                Button {
+                    tab = .processes
+                    search = String(service.pid)
+                } label: {
+                    Image(systemName: "list.bullet")
+                }.buttonStyle(.bordered).help("Найти процесс в списке")
                 Spacer(minLength: 0)
                 Button(role: .destructive) { pendingStop = service; showStopAlert = true } label: {
                     Label("Стоп", systemImage: "stop.circle")
@@ -508,6 +701,21 @@ private struct MacScopeWindow: View {
         .padding(20)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 15))
         .overlay(RoundedRectangle(cornerRadius: 15).stroke(Theme.border, lineWidth: 0.7))
+    }
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text).font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
+    }
+
+    private func loadRow(_ label: String, _ value: String, _ progress: Double) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(label).font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                Spacer()
+                Text(value).font(.system(size: 11, design: .monospaced))
+            }
+            ProgressView(value: min(1, max(0, progress))).tint(.white)
+        }
     }
 
     private var processPage: some View {
@@ -522,15 +730,17 @@ private struct MacScopeWindow: View {
                 searchField
             }
             VStack(spacing: 0) {
-                HStack {
+                HStack(spacing: 12) {
                     sortHeader("ПРОЦЕСС", key: .name, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 42)
                     sortHeader("PID", key: .pid, alignment: .trailing)
                         .frame(width: 70, alignment: .trailing)
                     sortHeader("CPU", key: .cpu, alignment: .trailing)
                         .frame(width: 80, alignment: .trailing)
                     sortHeader("RAM", key: .ram, alignment: .trailing)
                         .frame(width: 100, alignment: .trailing)
+                    Color.clear.frame(width: 13, height: 13)
                 }
                 .font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(Theme.secondary)
                 .padding(15)
@@ -539,7 +749,7 @@ private struct MacScopeWindow: View {
                     HStack(spacing: 12) {
                         processIcon(process)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(process.name).font(.system(size: 12, weight: .semibold))
+                            Text(process.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
                             Text(CoreLogic.safeCommand(process.command)).font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(Theme.secondary).lineLimit(1).truncationMode(.middle)
                         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -643,9 +853,17 @@ private struct MacScopeWindow: View {
     }
 
     private func serviceIcon(_ service: LocalService) -> some View {
-        let http = store.probes[service.id]?.isHTTP == true
-        let kind = http ? ServiceKind.website : service.kind
-        let icon: String = kind == .website ? "globe" : (kind == .database ? "externaldrive" : "server.rack")
+        // Системная служба остаётся службой, даже если отвечает HTTP (AirPlay и т.п.).
+        let kind: ServiceKind = service.kind == .infrastructure
+            ? .infrastructure
+            : (store.probes[service.id]?.isHTTP == true ? .website : service.kind)
+        let icon: String
+        switch kind {
+        case .website: icon = "globe"
+        case .database: icon = "externaldrive"
+        case .infrastructure: icon = "gearshape"
+        case .other: icon = "server.rack"
+        }
         return Image(systemName: icon)
             .font(.system(size: 16, weight: .medium)).foregroundStyle(Theme.ink)
             .frame(width: 38, height: 38)

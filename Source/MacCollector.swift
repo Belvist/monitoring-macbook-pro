@@ -41,9 +41,8 @@ struct MacCollector {
 
         // ps rss — только резидентная память: сжатая, swap и GPU-память (MPS/Metal) в неё
         // не входят, поэтому процесс на 6 ГБ выглядит как 400 МБ. MEM у top — полный
-        // footprint как в Activity Monitor, берём его, rss остаётся запасным вариантом.
-        let topMem = CoreLogic.parseTopMem(Shell.output("/usr/bin/top",
-            ["-l", "1", "-n", String(s.processes.count + 64), "-o", "mem", "-stats", "pid,mem"]))
+        // footprint как в Activity Monitor. top считается отдельно раз в 10 с, здесь только читаем кэш.
+        let topMem = cachedFootprint()
         if !topMem.isEmpty {
             for i in s.processes.indices {
                 if let m = topMem[s.processes[i].pid] { s.processes[i].memoryBytes = m }
@@ -66,16 +65,17 @@ struct MacCollector {
         let rawLsof = Shell.output("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcfn"])
         let listeners = CoreLogic.parseLsof(rawLsof)
         let byPID = Dictionary(uniqueKeysWithValues: s.processes.map { ($0.pid, $0) })
-        var cachedCWD: [Int32: String] = [:]
-        for l in listeners.prefix(180) {
+        // Раньше на каждый PID отдельный lsof — 3+ секунды на обновление. Один батч: ~25 мс.
+        var cwdByPID: [Int32: String] = [:]
+        let pids = Array(Set(listeners.map(\.pid))).sorted()
+        if !pids.isEmpty {
+            let list = pids.map(String.init).joined(separator: ",")
+            cwdByPID = CoreLogic.parseLsofCWD(Shell.output("/usr/sbin/lsof",
+                ["-nP", "-a", "-d", "cwd", "-p", list, "-Fn"]))
+        }
+        for l in listeners {
             guard let process = byPID[l.pid] else { continue }
-            let cwd: String
-            if let cached = cachedCWD[l.pid] { cwd = cached }
-            else {
-                let reply = Shell.output("/usr/sbin/lsof", ["-nP", "-a", "-p", String(l.pid), "-d", "cwd", "-Fn"])
-                cwd = reply.split(separator: "\n").map(String.init).first(where: { $0.hasPrefix("n/") }).map { String($0.dropFirst()) } ?? ""
-                cachedCWD[l.pid] = cwd
-            }
+            let cwd = cwdByPID[l.pid] ?? ""
             s.services.append(LocalService(pid: l.pid, port: l.port, address: l.address,
                 processName: process.name,
                 project: CoreLogic.projectName(path: cwd, processName: process.name),
@@ -84,16 +84,7 @@ struct MacCollector {
                 cpu: process.cpu, memoryBytes: process.memoryBytes,
                 userOwned: process.uid == getuid()))
         }
-        // Prefer loopback when a process listens on both IPv4 and IPv6 or on all interfaces.
-        var dedup: [String: LocalService] = [:]
-        for item in s.services {
-            let key = item.id
-            if let previous = dedup[key] {
-                if item.address == "127.0.0.1" || item.address == "::1" { dedup[key] = item }
-                else if previous.address == "*" { dedup[key] = item }
-            } else { dedup[key] = item }
-        }
-        s.services = dedup.values.sorted { $0.port < $1.port }
+        s.services = CoreLogic.dedupServices(s.services)
 
         if let deltaTotal { s.cpuPercent = min(100, deltaTotal / Double(count)) }
         else { s.cpuPercent = min(100, s.processes.reduce(0) { $0 + $1.cpu } / Double(count)) }
@@ -205,31 +196,65 @@ struct MacCollector {
         }
     }
 
-    static func probeWebsite(service: LocalService) -> SiteProbe {
-        guard (1...65535).contains(service.port), let url = service.pageURL else {
-            return SiteProbe(httpStatus: nil, title: nil, detail: "Неверный порт")
-        }
+    private static let footprintLock = NSLock()
+    private static var footprintCache: [Int32: Int64] = [:]
+    private static var footprintAt = Date.distantPast
+
+    /// Пересчитывает footprint раз в 10 с в фоне, чтобы не тормозить обычное обновление метрик.
+    static func refreshFootprint(force: Bool = false) {
+        let now = Date()
+        if !force && now.timeIntervalSince(footprintAt) < 10 { return }
+        let rows = CoreLogic.parseTopMem(Shell.output("/usr/bin/top",
+            ["-l", "1", "-n", "1200", "-o", "mem", "-stats", "pid,mem"]))
+        guard !rows.isEmpty else { return }
+        footprintLock.lock()
+        footprintCache = rows
+        footprintAt = Date()
+        footprintLock.unlock()
+    }
+
+    static func cachedFootprint() -> [Int32: Int64] {
+        footprintLock.lock()
+        defer { footprintLock.unlock() }
+        return footprintCache
+    }
+
+    // Одна сессия на всё время работы приложения: создавать её на каждую пробу дорого.
+    private static let probeSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 0.9
         config.timeoutIntervalForResource = 1.1
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)
+        return URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)
+    }()
+
+    static func probeWebsite(service: LocalService) -> SiteProbe {
+        guard (1...65535).contains(service.port), let url = service.probeURL else {
+            return SiteProbe(httpStatus: nil, title: nil, detail: "Неверный порт")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("MacScope/1.0", forHTTPHeaderField: "User-Agent")
         let box = ProbeResultBox()
         let done = DispatchSemaphore(value: 0)
-        let task = session.dataTask(with: request) { data, response, error in
+        let task = probeSession.dataTask(with: request) { data, response, error in
             defer { done.signal() }
-            guard let response = response as? HTTPURLResponse else { return }
-            let body = String(data: (data ?? Data()).prefix(128_000), encoding: .utf8) ?? ""
-            let title = CoreLogic.htmlTitle(body)
-            box.set(SiteProbe(httpStatus: response.statusCode, title: title, detail: "HTTP \(response.statusCode)"))
+            if let response = response as? HTTPURLResponse {
+                let body = String(data: (data ?? Data()).prefix(128_000), encoding: .utf8) ?? ""
+                let title = CoreLogic.htmlTitle(body)
+                box.set(SiteProbe(httpStatus: response.statusCode, title: title,
+                                  detail: "HTTP \(response.statusCode)"))
+            } else if let error = error as NSError?, error.code == NSURLErrorTimedOut {
+                box.set(SiteProbe(httpStatus: nil, title: nil, detail: "Нет ответа за 1 с"))
+            } else {
+                box.set(SiteProbe(httpStatus: nil, title: nil, detail: "Сокет закрыт / не HTTP"))
+            }
         }
         task.resume()
-        let finished = done.wait(timeout: .now() + 1.3) == .success
-        if !finished { task.cancel() }
-        session.invalidateAndCancel()
+        guard done.wait(timeout: .now() + 1.3) == .success else {
+            task.cancel()
+            return SiteProbe(httpStatus: nil, title: nil, detail: "Нет ответа за 1 с")
+        }
         return box.get()
     }
 

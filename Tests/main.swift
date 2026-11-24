@@ -17,6 +17,10 @@ expect(CoreLogic.parseLsof("p1\nn127.0.0.1:5555->127.0.0.1:44\n").isEmpty, "Reje
 expect(CoreLogic.projectName(path: "/Users/u/dev/imvera", processName: "node") == "imvera", "Project identification")
 expect(CoreLogic.detectKind(process: "postgres", command: "postgres", port: 5432) == .database, "DB category")
 expect(CoreLogic.detectKind(process: "node", command: "vite", port: 5173) == .website, "Web category")
+expect(CoreLogic.detectKind(process: "ControlCenter", command: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter", port: 5000) == .infrastructure, "AirPlay is not a website")
+expect(CoreLogic.detectKind(process: "rapportd", command: "/usr/libexec/rapportd", port: 61619) == .infrastructure, "Apple daemon")
+expect(CoreLogic.detectKind(process: "cupsd", command: "/usr/sbin/cupsd -l", port: 631) == .infrastructure, "Printer service")
+expect(CoreLogic.projectName(path: "/Users/earflow/Library/Containers/hossin.V2Box/Data", processName: "PacketTunnel") == "", "Junk cwd is not a project")
 expect(CoreLogic.htmlTitle("<html><TITLE> IMVERA &amp; Family </TITLE></html>") == "IMVERA & Family", "HTML title")
 expect(CoreLogic.safeCommand("uvicorn --token=abc123 PASSWORD=hi https://user:pass@example.com").contains("abc123") == false, "Secret protection")
 expect(CoreLogic.bytes(1073741824) == "1.0 ГБ", "Byte units")
@@ -58,4 +62,20 @@ expect(MacCollector.parseSwap("total = 4.00G used = 1.50G free = 2.50G") == 1610
 let netSample = "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\nen0 1500 <Link#2> 00:aa:bb:cc 123 0 250000 77 0 80000 0\nen0 1500 192.168.1 192.168.1.5 20 0 250000 20 0 80000 0\nen1 1500 <Link#3> 00:cc:dd 14 0 500 20 0 700 0\nutun0 1380 <Link#5> x 10 0 1000 5 0 2000 0\nlo0 16384 <Link#1> 00 1 0 100000000 1 0 100000000 0\n"
 let net = MacCollector.parseNetstat(netSample)
 expect(net.received == 251500 && net.sent == 82700, "Network counts link rows except lo0")
-print("PASS: 36 CoreLogic + macOS telemetry parsing assertions")
+let cwd = CoreLogic.parseLsofCWD("p663\nfcwd\nn/\np5091\nfcwd\nn/Users/u/Downloads/app\np722\nfcwd\nn/\n")
+expect(cwd[663] == "/" && cwd[5091] == "/Users/u/Downloads/app" && cwd[722] == "/" && cwd.count == 3, "Batched cwd parse")
+expect(CoreLogic.serviceScope("127.0.0.1") == .loopback && CoreLogic.serviceScope("::1") == .loopback, "Loopback scope")
+expect(CoreLogic.serviceScope("*") == .all && CoreLogic.serviceScope("192.168.1.5") == .lan, "All/LAN scope")
+expect(CoreLogic.hostForAddress("*") == "127.0.0.1" && CoreLogic.hostForAddress("::1") == "[::1]", "Host mapping")
+func svc(_ pid: Int32, _ port: Int, _ addr: String, _ cpu: Double, _ ram: Int64) -> LocalService {
+    LocalService(pid: pid, port: port, address: addr, processName: "p\(pid)", project: "", kind: .other,
+                 command: "/bin/p", workingDirectory: "", cpu: cpu, memoryBytes: ram, userOwned: true)
+}
+let svcs = [svc(1, 3000, "127.0.0.1", 2, 300), svc(2, 8000, "*", 9, 100), svc(3, 5000, "*", 5, 200)]
+expect(CoreLogic.sortServices(svcs, by: .ram, ascending: false, name: { $0.processName }).map(\.port) == [3000, 5000, 8000], "Service sort RAM")
+let dupes = CoreLogic.dedupServices([svc(1, 8000, "*", 0, 0), svc(1, 8000, "127.0.0.1", 0, 0), svc(2, 8000, "*", 0, 0)])
+expect(dupes.count == 2 && dupes.contains(where: { $0.address == "127.0.0.1" }), "Dedup IPv4/IPv6 keeps distinct listeners")
+let daemon = LocalService(pid: 9, port: 5000, address: "*", processName: "ControlCenter", project: "", kind: .infrastructure, command: "/System/ControlCenter", workingDirectory: "", cpu: 0, memoryBytes: 0, userOwned: true)
+expect(CoreLogic.isUserService(svc(1, 3000, "*", 0, 0)) == true, "Own non-system service")
+expect(CoreLogic.isUserService(daemon) == false, "macOS daemon is not 'my service'")
+print("PASS: 53 CoreLogic + macOS telemetry parsing assertions")

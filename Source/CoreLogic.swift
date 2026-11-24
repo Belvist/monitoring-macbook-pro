@@ -41,13 +41,43 @@ struct LocalService: Identifiable, Hashable {
     let userOwned: Bool
     var id: String { "\(pid):\(port)" }
     var defaultName: String { project.isEmpty ? processName : project }
-    var pageURL: URL? {
-        let host: String
-        if address == "*" || address == "0.0.0.0" || address == "::" { host = "127.0.0.1" }
-        else if address.contains(":") { host = "[\(address)]" }
-        else { host = address }
-        return URL(string: "http://\(host):\(port)/")
+    /// Адрес, на котором реально слушает сокет — для открытия сайта.
+    var pageURL: URL? { url(host: CoreLogic.hostForAddress(address)) }
+    /// Адрес для HTTP-проверки: слушатель может быть привязан к конкретному IP, а не к loopback.
+    var probeURL: URL? { url(host: CoreLogic.hostForAddress(address)) }
+    private func url(host: String) -> URL? { URL(string: "http://\(host):\(port)/") }
+    var scope: ServiceScope { CoreLogic.serviceScope(address) }
+}
+
+enum ServiceScope {
+    case loopback, all, lan
+    var label: String {
+        switch self {
+        case .loopback: return "Только этот Mac"
+        case .all: return "Все интерфейсы"
+        case .lan: return "Конкретный адрес"
+        }
     }
+    var symbol: String {
+        switch self {
+        case .loopback: return "lock"
+        case .all: return "network"
+        case .lan: return "arrow.triangle.branch"
+        }
+    }
+}
+
+enum ServiceSort: CaseIterable {
+    case port, cpu, ram, name
+    var label: String {
+        switch self {
+        case .port: return "порту"
+        case .cpu: return "CPU"
+        case .ram: return "RAM"
+        case .name: return "имени"
+        }
+    }
+    var ascendingByDefault: Bool { self == .name }
 }
 
 struct SiteProbe: Equatable {
@@ -193,6 +223,66 @@ enum CoreLogic {
         return out
     }
 
+    /// Один батч-вызов lsof для cwd всех слушателей вместо десятков одиночных.
+    static func parseLsofCWD(_ raw: String) -> [Int32: String] {
+        var out: [Int32: String] = [:]
+        var pid: Int32? = nil
+        for lineSub in raw.split(separator: "\n") {
+            let line = String(lineSub)
+            if line.hasPrefix("p"), let value = Int32(line.dropFirst()) { pid = value }
+            else if line.hasPrefix("n"), let current = pid {
+                let path = String(line.dropFirst())
+                if path.hasPrefix("/") { out[current] = path }
+            }
+        }
+        return out
+    }
+
+    static func hostForAddress(_ address: String) -> String {
+        if address == "*" || address == "0.0.0.0" || address == "::" { return "127.0.0.1" }
+        if address.contains(":") { return "[\(address)]" }
+        return address
+    }
+
+    static func serviceScope(_ address: String) -> ServiceScope {
+        if address == "127.0.0.1" || address == "::1" || address == "localhost" { return .loopback }
+        if address == "*" || address == "0.0.0.0" || address == "::" { return .all }
+        return .lan
+    }
+
+    /// Системные демоны macOS запущены от того же пользователя, но к «моим проектам» не относятся.
+    static func isUserService(_ service: LocalService) -> Bool {
+        service.userOwned && service.kind != .infrastructure
+    }
+
+    static func sortServices(_ rows: [LocalService], by key: ServiceSort, ascending: Bool,
+                             name: (LocalService) -> String) -> [LocalService] {
+        rows.sorted { a, b in
+            switch key {
+            case .port: return ascending ? a.port < b.port : a.port > b.port
+            case .cpu: return ascending ? a.cpu < b.cpu : a.cpu > b.cpu
+            case .ram: return ascending ? a.memoryBytes < b.memoryBytes : a.memoryBytes > b.memoryBytes
+            case .name:
+                let r = name(a).localizedCaseInsensitiveCompare(name(b))
+                if r == .orderedSame { return a.port < b.port }
+                return ascending ? r == .orderedAscending : r == .orderedDescending
+            }
+        }
+    }
+
+    /// Убирает дубли IPv4/IPv6 одного сокета, но сохраняет разные адреса и порты.
+    static func dedupServices(_ rows: [LocalService]) -> [LocalService] {
+        var byID: [String: LocalService] = [:]
+        for item in rows {
+            let key = "\(item.pid):\(item.port)"
+            if byID[key] != nil {
+                // Предпочитаем конкретный loopback, затем всё остальное, '*' — последним.
+                if item.scope == .loopback { byID[key] = item }
+            } else { byID[key] = item }
+        }
+        return byID.values.sorted { $0.port < $1.port }
+    }
+
     static func parseLsof(_ raw: String) -> [PortListener] {
         var pid: Int32? = nil
         var found: Set<PortListener> = []
@@ -221,6 +311,11 @@ enum CoreLogic {
 
     static func detectKind(process: String, command: String, port: Int) -> ServiceKind {
         let s = "\(process) \(command)".lowercased()
+        // Системные службы macOS — не сайты, даже если висят на «красивых» портах (AirPlay на 5000/7000).
+        if command.hasPrefix("/System/") || command.hasPrefix("/usr/libexec/") { return .infrastructure }
+        // Короткие имена в contains дают ложные срабатывания, поэтому только точные длинные.
+        if ["controlcenter", "rapportd", "sharingd", "cupsd", "smbd", "sshd",
+            "screensharingd", "trustd"].contains(where: s.contains) { return .infrastructure }
         if ["postgres", "redis-server", "mysqld", "mongod", "mariadb", "memcached", "clickhouse"].contains(where: s.contains) { return .database }
         if ["vite", "next", "nuxt", "uvicorn", "gunicorn", "flask", "fastapi", "http-server", "webpack", "httpd", "nginx", "caddy", "jupyter", "node", "bun ", "deno", "python -m http.server"].contains(where: s.contains) { return .website }
         if [80, 443, 3000, 3001, 4173, 5000, 5173, 8000, 8001, 8080, 8081, 8888].contains(port) { return .website }
@@ -233,7 +328,9 @@ enum CoreLogic {
         let parts = path.split(separator: "/").map(String.init)
         guard parts.count >= 4 else { return "" }
         let name = parts.last ?? ""
-        if ["", "MacOS", "bin", "sbin", "Resources", "Contents", "Applications", "Library", "Frameworks", "usr", "var", "private"].contains(name) { return "" }
+        if ["", "MacOS", "bin", "sbin", "Resources", "Contents", "Applications", "Library", "Frameworks",
+            "usr", "var", "private", "etc", "tmp", "Temp", "Data", "data", "Containers",
+            "Application Support", "Caches"].contains(name) { return "" }
         if name.hasPrefix(".") && name != ".vite" { return "" }
         return name
     }
